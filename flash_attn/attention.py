@@ -2398,6 +2398,11 @@ def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0,
             enabling the image-bidirectional OR-mask path for Gemma-4
             multimodal training. See `attention_flash_gqa` for semantics.
     """
+    if q.shape[-2] != k.shape[-2] or k.shape[-2] != v.shape[-2]:
+        raise ValueError(
+            "flash_attn_gqa_train requires equal Q/K/V sequence lengths; "
+            "use the HuggingFace triton_gqa_attention adapter for cached decoding"
+        )
     return FlashAttnGQAFunction.apply(
         q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl,
     )

@@ -21,8 +21,7 @@ register_triton_attention(name="my_attn")  # or pick your own
 ## What the adapter does
 
 The adapter (`triton_gqa_attention` in
-[`../flash_attn/hf_integration.py`](../flash_attn/hf_integration.py)) is ~40
-lines and has five responsibilities:
+[`../flash_attn/hf_integration.py`](../flash_attn/hf_integration.py)) handles:
 
 1. **Scaling reconciliation.** Gemma4 passes `scaling=1.0` with `1/√d` folded
    into `q_norm`; most other models pass `1/√d`. The adapter pre-multiplies
@@ -44,6 +43,21 @@ lines and has five responsibilities:
 5. **Loud failure on unsupported features.** `softcap ≠ 0` or non-zero
    `dropout` raise `NotImplementedError` immediately rather than silently
    producing wrong numerics.
+
+6. **Cached decoding.** The Triton training kernel requires equal Q/K/V
+   sequence lengths. The adapter uses PyTorch SDPA when Q and KV lengths
+   differ, or the query has fewer than 16 tokens. For a dynamic cache it
+   aligns queries with the suffix of KV, preserving the sliding window and
+   the requested scale (including Gemma4's `scaling=1.0`). This path respects
+   supplied 2D padding masks and uses supplied 4D boolean/additive masks as
+   authoritative. Static caches require an explicit 4D mask describing the
+   occupied positions. BlockMask inputs and image-group state without an
+   explicit 4D mask on sliding causal layers are unsupported on this path.
+
+   Regular square-sequence prefill/training still uses Triton and retains
+   its existing hardware requirements and mask limitations. Calling
+   `flash_attn_gqa_train` directly with unequal sequence lengths raises
+   `ValueError`; use the HF adapter for cached decoding.
 
 ## transformers 5.5.4 KeyError workaround
 

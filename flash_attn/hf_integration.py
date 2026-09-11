@@ -26,6 +26,7 @@ import contextvars
 from typing import NamedTuple
 
 import torch
+import torch.nn.functional as F
 
 from .attention import flash_attn_gqa_train
 
@@ -107,6 +108,44 @@ def _compute_image_group_state(mm_token_type_ids: torch.Tensor) -> _ImageGroupSt
     )
 
 
+def _sdpa_cached_attention(query, key, value, attention_mask, scale, is_causal, slide):
+    """Handle cached/short inputs outside the square-sequence Triton kernel.
+
+    With a dynamic KV cache, queries are the last Q tokens of the K tokens.
+    SDPA's rectangular ``is_causal=True`` mask is upper-left aligned, so build
+    the bottom-right aligned mask explicitly. A supplied 4D mask is authoritative
+    (it can also encode padding, static-cache positions or bidirectional spans).
+    """
+    nq, nk = query.shape[-2], key.shape[-2]
+    if attention_mask is not None and (
+        not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim not in (2, 4)
+    ):
+        raise NotImplementedError("Cached Triton attention requires a 2D or 4D tensor attention mask")
+
+    if attention_mask is not None and attention_mask.ndim == 4:
+        mask = attention_mask[..., :nk]
+    else:
+        mask = None
+        if is_causal:
+            q_pos = torch.arange(nq, device=query.device)[:, None] + nk - nq
+            k_pos = torch.arange(nk, device=query.device)[None, :]
+            mask = k_pos <= q_pos
+            if slide > 0:
+                mask = mask & (k_pos > q_pos - slide)
+        if attention_mask is not None:
+            padding_mask = attention_mask[:, None, None, :nk].bool()
+            mask = padding_mask if mask is None else mask & padding_mask
+
+    # Explicit expansion also allows D=512 to use SDPA's memory-efficient
+    # backend, which cannot consume unequal Q/KV head counts directly.
+    repeats = query.shape[1] // key.shape[1]
+    if repeats != 1:
+        key = key.repeat_interleave(repeats, dim=1)
+        value = value.repeat_interleave(repeats, dim=1)
+    out = F.scaled_dot_product_attention(query, key, value, attn_mask=mask, scale=scale)
+    return out.transpose(1, 2).contiguous(), None
+
+
 def triton_gqa_attention(
     module,
     query: torch.Tensor,            # (B, H_Q, N, D)
@@ -121,29 +160,37 @@ def triton_gqa_attention(
 ):
     """Adapter matching transformers' `attention_interface` contract.
 
-    Ignores `attention_mask` — our kernel builds its own causal / sliding-window
+    For square sequences, ignores `attention_mask` — our kernel builds its own causal / sliding-window
     mask internally from `sliding_window` and `module.is_causal`. HuggingFace's
     mask would normally encode the same thing, so ignoring it is safe when the
     kernel supports the requested pattern.
 
     Raises NotImplementedError for features the kernel doesn't support
     (softcap, nonzero dropout) — fail loudly rather than produce wrong numerics.
+    Cached decoding and sequences shorter than a Triton dot tile use SDPA,
+    preserving the supplied padding/4D mask and the model's attention scale.
     """
-    # Reconcile scaling. Our kernel bakes in 1/sqrt(D) internally. If the module
-    # passes a different `scaling` (e.g., Gemma4 passes 1.0 because scaling is
-    # folded into q_norm), pre-multiply q to cancel the kernel's internal scale.
-    scale = scaling if scaling is not None else module.head_dim ** -0.5
-    default_scale = query.shape[-1] ** -0.5
-    if scale != default_scale:
-        query = query * (scale / default_scale)
-
     if softcap is not None:
         raise NotImplementedError("triton_gqa_attention does not support softcap")
     if dropout != 0.0:
         raise NotImplementedError("triton_gqa_attention does not support dropout")
 
+    scale = scaling if scaling is not None else module.head_dim ** -0.5
     slide = int(sliding_window) if sliding_window else 0
     is_causal = getattr(module, "is_causal", True)
+    if query.shape[-2] != key.shape[-2] or query.shape[-2] < 16:
+        if slide > 0 and is_causal and _image_group_state.get() is not None and not (
+            isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4
+        ):
+            raise NotImplementedError("Cached/short image-group attention requires an explicit 4D mask")
+        return _sdpa_cached_attention(query, key, value, attention_mask, scale, is_causal, slide)
+
+    # Reconcile scaling. Our kernel bakes in 1/sqrt(D) internally. If the module
+    # passes a different `scaling` (e.g., Gemma4 passes 1.0 because scaling is
+    # folded into q_norm), pre-multiply q to cancel the kernel's internal scale.
+    default_scale = query.shape[-1] ** -0.5
+    if scale != default_scale:
+        query = query * (scale / default_scale)
 
     # Image-bidirectional mask path (Gemma-4 MoE multimodal training):
     # Sliding layers get an OR-mask that grants bidirectional attention
