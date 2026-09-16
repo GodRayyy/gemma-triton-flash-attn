@@ -49,10 +49,14 @@ The adapter (`triton_gqa_attention` in
    differ, or the query has fewer than 16 tokens. For a dynamic cache it
    aligns queries with the suffix of KV, preserving the sliding window and
    the requested scale (including Gemma4's `scaling=1.0`). This path respects
-   supplied 2D padding masks and uses supplied 4D boolean/additive masks as
-   authoritative. Static caches require an explicit 4D mask describing the
-   occupied positions. BlockMask inputs and image-group state without an
-   explicit 4D mask on sliding causal layers are unsupported on this path.
+   supplied 2D padding masks, aligning their trailing columns with the retained
+   KV suffix when a bounded dynamic cache has discarded older tokens. A 2D
+   mask must cover at least the retained KV length and end at the current
+   logical sequence position; shorter masks raise `ValueError`. Supplied 4D
+   boolean/additive masks are authoritative. Static caches require an explicit
+   4D mask describing the occupied positions. BlockMask inputs and image-group
+   state without an explicit 4D mask on sliding causal layers are unsupported
+   on this path.
 
    Regular square-sequence prefill/training still uses Triton and retains
    its existing hardware requirements and mask limitations. Calling

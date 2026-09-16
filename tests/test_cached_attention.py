@@ -88,6 +88,69 @@ class CachedAttentionTest(unittest.TestCase):
                                      q, k, v, torch.zeros_like(mask))
         torch.testing.assert_close(out, torch.zeros_like(out))
 
+    def test_truncated_cache_reads_valid_suffix(self):
+        q = torch.zeros(2, 8, 1, 8)
+        k = torch.zeros(2, 2, 4, 8)
+        v = torch.arange(4, 8, dtype=q.dtype)[None, None, :, None].expand_as(k)
+        padding = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1],
+                                [0, 0, 0, 0, 0, 0, 1, 1]])
+        out, _ = triton_gqa_attention(SimpleNamespace(head_dim=8, is_causal=True),
+                                     q, k, v, padding, sliding_window=4)
+        expected = torch.tensor([5.5, 6.5])[:, None, None, None].expand_as(out)
+        torch.testing.assert_close(out, expected)
+
+    def _check_truncated_cache_gradients(self, device, dtype, dim):
+        total_length, window = 12, 4
+        for nq in (1, 3):
+            with self.subTest(device=device, dtype=dtype, nq=nq):
+                q = (torch.randn(2, 8, nq, dim, device=device, dtype=dtype) * 0.25).requires_grad_()
+                k = (torch.randn(2, 2, total_length, dim, device=device, dtype=dtype) * 0.25).requires_grad_()
+                v = torch.randn_like(k, requires_grad=True)
+                padding = torch.ones(2, total_length, device=device, dtype=torch.bool)
+                padding[0, :4] = False
+                padding[1, :9] = False
+                # A bounded dynamic cache retains window - 1 past tokens plus
+                # the current queries. Compare against the untruncated history.
+                offset = total_length - (window - 1 + nq)
+                actual, _ = triton_gqa_attention(
+                    SimpleNamespace(head_dim=dim, is_causal=True),
+                    q, k[:, :, offset:], v[:, :, offset:], padding,
+                    scaling=1.0, sliding_window=window)
+                mask = causal_mask(nq, total_length, window, device)[None, None]
+                mask = mask & padding[:, None, None, :]
+                expected = reference(q, k, v, mask, 1.0)
+                if dtype == torch.float64:
+                    torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
+                else:
+                    torch.testing.assert_close(actual, expected, atol=0.012, rtol=0.04)
+                grad = torch.randn_like(actual)
+                actual_grads = torch.autograd.grad(actual, (q, k, v), grad)
+                expected_grads = torch.autograd.grad(expected, (q, k, v), grad)
+                for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+                    if dtype == torch.float64:
+                        torch.testing.assert_close(actual_grad, expected_grad, atol=1e-10, rtol=1e-10)
+                    else:
+                        error = actual_grad.float() - expected_grad.float()
+                        self.assertLess((error.norm() / expected_grad.float().norm()).item(), 0.015)
+                        self.assertLess((error.abs().max() / expected_grad.float().abs().max()).item(), 0.015)
+
+    def test_truncated_cache_masks_and_gradients(self):
+        self._check_truncated_cache_gradients('cpu', torch.float64, 8)
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required')
+    def test_truncated_cache_cuda_masks_and_gradients(self):
+        for dtype in (torch.bfloat16, torch.float16):
+            self._check_truncated_cache_gradients('cuda', dtype, 256)
+
+    def test_padding_mask_shorter_than_cache_is_rejected(self):
+        q = torch.zeros(1, 8, 1, 8)
+        k = torch.zeros(1, 2, 4, 8)
+        for length in (0, 1, 3):
+            with self.subTest(length=length):
+                with self.assertRaisesRegex(ValueError, '2D attention mask.*KV length'):
+                    triton_gqa_attention(SimpleNamespace(head_dim=8, is_causal=True),
+                                         q, k, k, torch.ones(1, length), sliding_window=4)
+
     def test_short_prefill_and_noncausal(self):
         for causal in (True, False):
             for nq, nk in ((1, 1), (7, 7), (3, 9)):

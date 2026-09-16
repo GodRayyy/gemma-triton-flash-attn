@@ -133,7 +133,11 @@ def _sdpa_cached_attention(query, key, value, attention_mask, scale, is_causal, 
             if slide > 0:
                 mask = mask & (k_pos > q_pos - slide)
         if attention_mask is not None:
-            padding_mask = attention_mask[:, None, None, :nk].bool()
+            if attention_mask.shape[-1] < nk:
+                raise ValueError("2D attention mask must cover at least the KV length")
+            # A bounded dynamic cache keeps the most recent K/V tokens, while
+            # the padding mask can still describe the full logical sequence.
+            padding_mask = attention_mask[:, None, None, -nk:].bool()
             mask = padding_mask if mask is None else mask & padding_mask
 
     # Explicit expansion also allows D=512 to use SDPA's memory-efficient
